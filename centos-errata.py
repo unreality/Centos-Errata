@@ -40,6 +40,7 @@ import sys
 import traceback
 import urllib
 import xmlrpclib
+import hashlib
 
 class RHNSystem:
     def __init__(self,sysid,name,lastCheckin):
@@ -214,6 +215,7 @@ class RHNSession:
         self.rhnUrl = 'https://'+self.rhnServerName+'/rpc/api'
         self.server = xmlrpclib.Server(self.rhnUrl)
         self.rhnSessionKey=self.rhnLogin(self.login,self.password)
+        self.satellite_dir = '/var/satellite/'
 
     @staticmethod
     def addRequiredOptions(parser):
@@ -238,6 +240,10 @@ class RHNSession:
             sys.exit(2)
 
         mySession = RHNSession(options.server,options.login,options.password)
+        
+        if options.satellite_dir:
+            mySession.setSatelliteDir(options.satellite_dir)
+        
         return mySession
 
     def rhnLogin(self, login, password): 
@@ -391,7 +397,10 @@ class RHNSession:
             else:
                 raise
         return out
-        
+    
+    def setSatelliteDir(self, dir):
+        self.satellite_dir = dir
+                
     def setCustomValues(self,systemObj,customInfoDict):
         out=[]
         if not customInfoDict is None:
@@ -578,6 +587,58 @@ class RHNSession:
             if f.faultCode==-20:
                 self.rhnLogin(self.login,self.password)
                 return self.findPackageByNameAndChecksum(pkg_name,pkg_checksum)
+            else:
+                raise
+
+        return None
+        
+    def findPackageByFileNameAndNameAndSHAChecksum(self,pkg_filename, pkg_name, pkg_checksum):
+        result= None
+        pkg_details = None
+        
+        try:
+            #Fortunately this RPC method returns an empty list if the package does not exist, no need to handle an undocumented exception
+            result = self.server.packages.search.name(self.rhnSessionKey,pkg_name)
+
+            if len(result) > 0:
+                for search_result in result:
+                    if pkg_name == search_result['name']:
+                        pkg_details = self.server.packages.getDetails(self.rhnSessionKey,search_result['id'])
+                        
+                        if pkg_details['file'] == pkg_filename:
+                            found = False
+                            
+                            if pkg_details['checksum_type'] == 'md5':
+                                #generate sha256 to compare
+                                print "Generating sha256sum for " + pkg_details['path']
+                                hasher = hashlib.sha256()
+                                pkg_file = open(os.path.join(self.satellite_dir, pkg_details['path']))
+                                
+                                buf = pkg_file.read(8096)
+                                while len(buf) > 0:
+                                    hasher.update(buf)
+                                    buf = pkg_file.read(8096)
+                                
+                                sha_checksum = hasher.hexdigest()
+                                
+                                if sha_checksum == pkg_checksum:
+                                    found = True
+                            else:
+                                if pkg_checksum == pkg_details['checksum']:
+                                    found = True
+                                
+                            if found:
+                                print "Found package %s - %s" % (pkg_filename, pkg_checksum)
+                                server_pkg = RHNPackage(pkg_details['name'],pkg_details['version'],pkg_details['release'],pkg_details['epoch'],pkg_details['arch_label'])
+                                server_pkg.id = pkg_details['id']
+                                server_pkg.path = pkg_details['path']
+                                server_pkg.lastModified=pkg_details['last_modified_date']
+                                return server_pkg
+                
+        except  xmlrpclib.Fault, f:
+            if f.faultCode==-20:
+                self.rhnLogin(self.login,self.password)
+                return self.findPackageByFileNameAndNameAndSHAChecksum(pkg_filename, pkg_name, pkg_checksum)
             else:
                 raise
 
@@ -819,7 +880,7 @@ class MessageParser(object):
             info_match = MessageParser.bug_info_re.match(erratum_subject_match.group('other_info'))
 
         if info_match is None:
-            print "Errata '%s' doesnt match any of the known types " % erratum_subject 
+            print "Errata '%s' doesnt match any of the known types " % message_subject 
             return None
 
         parsed_msg.centosVersion = info_match.group('version')            
@@ -1125,8 +1186,12 @@ class SearchSpacewalk(SearchStrategy):
         if self.rhnSession is None:
             print "Test mode: would search spacewalk for %s (%s)" % (pkg_name_only, pkg_info.checksum)
             return None
-    
-        return self.rhnSession.findPackageByNameAndChecksum(pkg_name_only, pkg_info.checksum)        
+        
+        if len(pkg_info.checksum) == 64:
+            #its probably a sha256
+            return self.rhnSession.findPackageByFileNameAndNameAndSHAChecksum(pkg_info.filename, pkg_name_only, pkg_info.checksum)
+        else:
+            return self.rhnSession.findPackageByNameAndChecksum(pkg_name_only, pkg_info.checksum)        
 
     def getName(self):
         return "spacewalk"
@@ -1210,7 +1275,16 @@ def process_args():
     config = ConfigParser.SafeConfigParser()
     try:
         #Could add a search path for this config file
-        config.readfp(open(CONFIG_FILE))
+        user_config_file = CONFIG_FILE
+        
+        # see if config file has been specified on command line
+        try:
+            arg_index = sys.argv.index("-c")
+            user_config_file = sys.argv[arg_index+1]                
+        except Exception,err:
+            pass
+            
+        config.readfp(open(user_config_file))
     except IOError,err:
         print "Unable to read default config file %s. This file is required for correct operation of the tool. \mReason: %s" % (CONFIG_FILE,err)
         sys.exit(1)
@@ -1526,17 +1600,15 @@ def main():
             if fasttrack_package_dir_unset:
                 print "You cannot use the 'dir' search strategy without specifying fasttrack package directories for each architecture with a fasttrack channel enabled"
                 strategy_ok = False
-                
-        elif strategy == "spacewalk":
-            if script_config.options.testmode:
-                print "Warning: you are using test mode and have the spacewalk search strategy enabled.\nThis will return no results as there is no connection to the spacewalk server in test mode"
-            print "The satellite strategy no longer works due to CentOS sending out sha256 signatures instead of md5sum signatures. Use 'dir'"    
-            strategy_ok = False
         elif strategy == "satellitedir":
             if not os.path.exists(script_config.options.satellite_dir):
                 print "Warning: satellite dir %s does not exist. You need to be running this on a spacewalk server" % script_config.options.satellite_dir
-            print "The satellitedir strategy no longer works due to CentOS sending out sha256 signatures instead of md5sum signatures. Use 'dir'"    
+            print "The satellitedir strategy no longer works. Use 'dir'"    
             strategy_ok = False
+        elif strategy == "spacewalk":
+            if not os.path.exists(script_config.options.satellite_dir) and script_config.options.centos_version == 5:
+                print "Warning: satellite dir %s does not exist, and you are adding CentOS 5 errata. You need to be running this on a spacewalk server, and configure the satellide_dir option it order for this script to generate matching sha256 hashes." % script_config.options.satellite_dir
+                strategy_ok = False
         else:
             print "Invalid search strategy '%s'. " % strategy
             strategy_ok = False
@@ -1619,6 +1691,9 @@ def main():
                 print "An exception occured when communicating with the server. Skipping erratum %s. Reason:" % erratum.advisoryName
                 print e
                 traceback.print_exc(file=sys.stdout)
+                print "Errata dump:"
+                erratum.printOut()
+                print "------"
 
     
 if __name__ == "__main__":
